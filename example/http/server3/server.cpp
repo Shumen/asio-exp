@@ -18,23 +18,16 @@ namespace http {
 namespace server3 {
 
 server::server(const std::string& address, const std::string& port,
-    const std::string& doc_root, std::size_t thread_pool_size)
+    const std::string& doc_root, std::size_t thread_pool_size,
+    time_t timeout_duration_ms)
   : thread_pool_size_(thread_pool_size),
-    signals_(io_service_),
+    timeout_duration_ms_(timeout_duration_ms),
+    strand_(io_service_),
     acceptor_(io_service_),
-    new_connection_(),
+    new_connection_(new connection(io_service_, request_handler_,
+      timeout_duration_ms_)),
     request_handler_(doc_root)
 {
-  // Register to handle the signals that indicate when the server should exit.
-  // It is safe to register for the same signal multiple times in a program,
-  // provided all registration for the specified signal is made through Asio.
-  signals_.add(SIGINT);
-  signals_.add(SIGTERM);
-#if defined(SIGQUIT)
-  signals_.add(SIGQUIT);
-#endif // defined(SIGQUIT)
-  signals_.async_wait(boost::bind(&server::handle_stop, this));
-
   // Open the acceptor with the option to reuse the address (i.e. SO_REUSEADDR).
   boost::asio::ip::tcp::resolver resolver(io_service_);
   boost::asio::ip::tcp::resolver::query query(address, port);
@@ -43,8 +36,10 @@ server::server(const std::string& address, const std::string& port,
   acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
   acceptor_.bind(endpoint);
   acceptor_.listen();
-
-  start_accept();
+  acceptor_.async_accept(new_connection_->socket(),
+      strand_.wrap(
+        boost::bind(&server::handle_accept, this,
+          boost::asio::placeholders::error)));
 }
 
 void server::run()
@@ -61,14 +56,24 @@ void server::run()
   // Wait for all threads in the pool to exit.
   for (std::size_t i = 0; i < threads.size(); ++i)
     threads[i]->join();
+
+  // Reset io_services.
+  io_service_.reset();
 }
 
-void server::start_accept()
+void server::stop()
 {
-  new_connection_.reset(new connection(io_service_, request_handler_));
-  acceptor_.async_accept(new_connection_->socket(),
-      boost::bind(&server::handle_accept, this,
-        boost::asio::placeholders::error));
+  // Post a call to the stop function so that server::stop() is safe to call
+  // from any thread.
+  io_service_.post(
+      strand_.wrap(
+        boost::bind(&server::handle_stop, this)));
+}
+
+void server::abort()
+{
+  // Stop io_services the hard way.
+  io_service_.stop();
 }
 
 void server::handle_accept(const boost::system::error_code& e)
@@ -76,14 +81,21 @@ void server::handle_accept(const boost::system::error_code& e)
   if (!e)
   {
     new_connection_->start();
+    new_connection_.reset(new connection(io_service_, request_handler_,
+      timeout_duration_ms_));
+    acceptor_.async_accept(new_connection_->socket(),
+        strand_.wrap(
+          boost::bind(&server::handle_accept, this,
+            boost::asio::placeholders::error)));
   }
-
-  start_accept();
 }
 
 void server::handle_stop()
 {
-  io_service_.stop();
+  // The server is stopped by closing the acceptor.
+  // When all outstanding operations are completed
+  // all calls to io_service::run() will return.
+  acceptor_.close();
 }
 
 } // namespace server3
